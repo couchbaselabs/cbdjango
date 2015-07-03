@@ -12,22 +12,26 @@ def mk_b64(value):
 def extract_b64(raw):
     return b64decode(raw.replace('_', '/') + '==')
 
+
+NO_VALUE = object()
+
+
 class DocID(object):
     FMT_UUID = 'U'
     FMT_STRING = 'S'
     DELIMITER = ':'
 
     def __init__(self):
-        self.strval = ''
-        self.intval = -1
+        self.strval = NO_VALUE
+        self.intval = NO_VALUE
 
     def to_string(self):
-        if not self.strval:
+        if self.strval is NO_VALUE:
             raise ValueError('No string value!')
         return self.strval
 
     def to_int(self):
-        if not self.intval:
+        if self.intval is NO_VALUE:
             raise ValueError('No int value!')
         return self.intval
 
@@ -35,6 +39,7 @@ class DocID(object):
     def decode(cls, raw):
         _, fmt, value = raw.split(cls.DELIMITER)
         obj = cls()
+        fmt = fmt.upper()
 
         if fmt == cls.FMT_STRING:
             obj.strval = value
@@ -64,3 +69,9 @@ class DocID(object):
     @staticmethod
     def generate(table):
         return DocID.encode(table, uuid4())
+
+    def __str__(self):
+        return self.to_string()
+
+    def __int__(self):
+        return self.to_int()

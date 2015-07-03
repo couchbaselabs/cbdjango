@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, date
 from django.db.models import DateTimeField
 
 
@@ -48,6 +48,27 @@ class EndsWithOperator(LikeOperator):
     def process_rhs(cls, rhs):
         return '%{0}'.format(rhs)
 
+class LikeOperatorNC(CustomOperator):
+    @classmethod
+    def get_constraint(cls, lhs, rhs):
+        return 'LOWER({})'.format(lhs), '=', rhs
+
+    @classmethod
+    def process_rhs(cls, rhs):
+        return rhs.lower()
+
+
+class RegexOperator(CustomOperator):
+    @classmethod
+    def get_constraint(cls, lhs, rhs):
+        return ['REGEXP_CONTAINS( TOSTRING({}),{} )'.format(lhs, rhs)]
+
+
+class RegexOperatorNC(CustomOperator):
+    @classmethod
+    def get_constraint(cls, lhs, rhs):
+        return ['REGEXP_CONTAINS( LOWER(TOSTRING({})), LOWER({}) )'.format(lhs, rhs)]
+
 
 class DateParseOperator(CustomOperator):
     date_part = None
@@ -58,10 +79,33 @@ class DateParseOperator(CustomOperator):
         return 'DATE_PART_STR({lhs}, "{part}"){adj}'.format(
             lhs=lhs, part=cls.date_part, adj=cls.adj), '=', rhs
 
+    @classmethod
+    def process_rhs(cls, rhs):
+        if isinstance(rhs, (basestring, int)):
+            return rhs
+
+        assert isinstance(rhs, (datetime, date))
+        if cls.date_part == 'year':
+            return rhs.year
+        elif cls.date_part == 'month':
+            return rhs.month
+        elif cls.date_part == 'day':
+            return rhs.day
+        elif cls.date_part == 'iso_dow':
+            return rhs.isoweekday()
+        else:
+            raise Exception('Unrecognized year lookup!')
+
 
 class DayOfWeekOperator(DateParseOperator):
     date_part = 'iso_dow'
     adj = '+1'
+
+
+class DateComparisonOperator(object):
+    @classmethod
+    def get_constraint(cls, lhs, placeholder, sym):
+        return 'STR_TO_MILLIS({})'.format(lhs), sym, 'STR_TO_MILLIS({})'.format(placeholder)
 
 
 def _mk_dateop(ss):
@@ -69,12 +113,17 @@ def _mk_dateop(ss):
         date_part = ss
     return _Dateop
 
+# Simple arithmetic comparison fields
+SIMPLE_CMP_MAP = {
+    'exact': '=',
+    'gt': '>',
+    'gte': '>=',
+    'lt': '<',
+    'lte': '<='
+}
+
 OPERATOR_MAP = {
-    'exact': lambda lhs, rhs: (lhs, '=', rhs),
-    'gt': lambda lhs, rhs: (lhs, '>', rhs),
-    'gte': lambda lhs, rhs: (lhs, '>=', rhs),
-    'lt': lambda lhs, rhs: (lhs, '<', rhs),
-    'lte': lambda lhs, rhs: (lhs, '<=', rhs),
+    'iexact': LikeOperatorNC,
     'in': lambda lhs, rhs: (lhs, 'IN', rhs),
     'year': _mk_dateop("year"),
     'month': _mk_dateop("month"),
@@ -82,19 +131,38 @@ OPERATOR_MAP = {
     'week_day': DayOfWeekOperator,
     'contains': ContainsOperator,
     'startswith': StartsWithOperator,
-    'endswith': EndsWithOperator
+    'endswith': EndsWithOperator,
+    'regex': RegexOperator,
+    'iregex': RegexOperatorNC
 }
-
 
 class Operators(object):
     @staticmethod
-    def convert(rhs, lhs, placeholder, lookup):
-        opfn = OPERATOR_MAP[lookup]
-        if hasattr(opfn, 'get_constraint'):
-            tokens = opfn.get_constraint(lhs, placeholder)
-            rhs = opfn.process_rhs(rhs)
+    def convert(rhs, lhs, placeholder, lookup, field):
+        """
+        Convert a lookup into a set of N1QL tokens
+        :param rhs: The value to compare to
+        :param lhs: The column to compare
+        :param placeholder: The placeholder representing the right hand value
+        :param lookup: The lookup type
+        :param field: The field associated with the left-hand side
+        :return: A tuple of (rhs_value, tokens), where rhs_value is the VALUE to use
+            for the placeholder. This may change if the rhs value needs to be modified
+            (in Python).
+        """
+        if lookup in SIMPLE_CMP_MAP:
+            nsym = SIMPLE_CMP_MAP[lookup]
+            if field.get_internal_type() in ('DateField', 'DateTimeField'):
+                tokens = DateComparisonOperator.get_constraint(lhs, placeholder, nsym)
+            else:
+                tokens = lhs, nsym, placeholder
         else:
-            tokens = opfn(lhs, placeholder)
+            opfn = OPERATOR_MAP[lookup]
+            if hasattr(opfn, 'get_constraint'):
+                tokens = opfn.get_constraint(lhs, placeholder)
+                rhs = opfn.process_rhs(rhs)
+            else:
+                tokens = opfn(lhs, placeholder)
 
         return rhs, tokens
 

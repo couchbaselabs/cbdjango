@@ -1,22 +1,16 @@
 from pprint import pprint
-import itertools
-import datetime
 
-from django.conf import settings
 from django.db import DatabaseError
-from django.db.backends import (
-    BaseDatabaseOperations,
-    BaseDatabaseClient,
-    BaseDatabaseIntrospection,
-    BaseDatabaseWrapper,
-    BaseDatabaseFeatures,
-    BaseDatabaseValidation
-)
+from django.db.backends.base.operations import BaseDatabaseOperations
+from django.db.backends.base.client import BaseDatabaseClient
+from django.db.backends.base.introspection import BaseDatabaseIntrospection, TableInfo
+from django.db.backends.base.base import BaseDatabaseWrapper
+from django.db.backends.base.features import BaseDatabaseFeatures
+from django.db.backends.base.validation import BaseDatabaseValidation
+from django.db.backends.base.creation import BaseDatabaseCreation
+from django.db.backends.base.schema import BaseDatabaseSchemaEditor
 
-from django.db.backends.schema import BaseDatabaseSchemaEditor
-from django.db.backends.creation import BaseDatabaseCreation
 from django.utils.dateparse import parse_datetime, parse_date
-from django.utils import timezone
 
 
 from couchbase.bucket import Bucket
@@ -25,7 +19,8 @@ from couchbase.connstr import ConnectionString
 import cbdjango.db.backends.couchbase.dbapi as Database
 from .utils import n1ql_escape, DocID
 from .compiler import SelectCommand, InsertCommand, UpdateCommand, FlushCommand,\
-    DeleteCommand
+    DeleteCommand, CreateIndexCommand
+
 from .operators import DateTransformField
 
 class Connection(object):
@@ -73,6 +68,8 @@ class Cursor(object):
             sql.execute(self.bucket)
         elif isinstance(sql, DeleteCommand):
             self.rowcount = sql.execute(self.bucket)
+        elif isinstance(sql, CreateIndexCommand):
+            sql.execute(self.bucket)
 
     # def next(self):
     #     return self._fetchone()
@@ -160,8 +157,24 @@ class DatabaseCreation(BaseDatabaseCreation):
     def sql_for_pending_references(self, model, *args, **kwargs):
         return []
 
+    def sql_indexes_for_fields(self, model, fields, style):
+        cols = []
+        for field in fields:
+            if field.primary_key:
+                continue
+            cols.append(field.column)
+
+        ix_name = 'idx_' + '_'.join(cols)
+        return [[ix_name, cols]]
+
     def sql_indexes_for_model(self, model, *args, **kwargs):
+        s = super(self.__class__, self).sql_indexes_for_model(model, *args, **kwargs)
+        # if s:
+        #     return [CreateIndexCommand(s)]
         return []
+
+    def create_test_db(self, verbosity=1, autoclobber=False, serialize=True, keepdb=False):
+        return 'test_'
 
 
 class DatabaseFeatures(BaseDatabaseFeatures):
@@ -171,7 +184,7 @@ class DatabaseFeatures(BaseDatabaseFeatures):
     supports_select_related = False
     autocommits_when_autocommit_is_off = True
     uses_savepoints = False
-    allows_auto_pk_0 = False
+    allows_auto_pk_0 = True  # Anything is OK
 
 def coerce_unicode(value):
     if isinstance(value, str):
@@ -197,7 +210,20 @@ class DatabaseOperations(BaseDatabaseOperations):
         return cursor.lastrowid
 
     def convert_values(self, value, field):
-        if field.get_internal_type() == 'AutoField':
+        # Normalize the DocID back
+        if field.primary_key:
+            value = DocID.decode(value)
+            if hasattr(field, 'rel') and field.rel:
+                field = field.rel.to
+
+            if field.get_internal_type() in ('AutoField', 'IntegerField'):
+                return value.to_int()
+            elif field.get_internal_type() in ('CharField', 'TextField'):
+                return value.to_string()
+            else:
+                raise Exception('Unknown internal type ' + field.get_internal_type())
+
+        if field.get_internal_type() == 'AutoField' and not isinstance(value, DocID):
             return DocID.decode(value).to_int()
         elif field.get_internal_type() == 'DateTimeField':
             # print "Converting DateTimeField..", value
@@ -208,7 +234,7 @@ class DatabaseOperations(BaseDatabaseOperations):
         elif field.get_internal_type() == 'DateField':
             return parse_date(value)
         else:
-            return super(DatabaseOperations, self).convert_values(value, field)
+            return value
 
     def sql_flush(self, style, tables, seqs, allow_cascade=False):
         return [FlushCommand(tables)]
@@ -254,11 +280,11 @@ class DatabaseIntrospection(BaseDatabaseIntrospection):
         cb = self.connection.get_new_connection({})
         bucket = cb.bucket
         qstr = 'SELECT DISTINCT __CBTP FROM {0}'.format(n1ql_escape(bucket.bucket))
-        return [x for x in bucket.n1ql_query(qstr)]
+        return [TableInfo(x, "t") for x in bucket.n1ql_query(qstr)]
 
 
 class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
-    def column_sql(self, model, field, *args, **kw):
+    def column_sql(self, model, field):
         return "", {}
 
     def create_model(self, model):
@@ -268,15 +294,18 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
     def alter_unique_together(self, *args, **kwargs):
         pass
 
+    def alter_field(self, from_model, from_field, to_field):
+        pass
+
+    def remove_field(self, from_model, field):
+        pass
+
 
 class DatabaseWrapper(BaseDatabaseWrapper):
     Database = Database
 
     def __init__(self, *args, **kwds):
         super(DatabaseWrapper, self).__init__(*args, **kwds)
-        pprint(args)
-        pprint(kwds)
-
         self.features = DatabaseFeatures(self)
         self.ops = DatabaseOperations(self)
         self.client = DatabaseClient(self)
@@ -299,8 +328,9 @@ class DatabaseWrapper(BaseDatabaseWrapper):
             bucket = self._buckets[name]
         except KeyError:
             print "Connecting to bucket", name
-
             cstr = ConnectionString.parse(self.settings_dict['CONNECTION_STRING'])
+            cstr.options['fetch_mutation_tokens'] = '1'
+
             cstr.bucket = name
             bucket = Bucket(str(cstr))
             self._buckets[name] = bucket
